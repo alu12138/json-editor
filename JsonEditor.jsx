@@ -1,6 +1,8 @@
-import React, { useState } from "react";
-import { Tree, Input, Button, Modal, message, Upload } from "antd";
-import { UploadOutlined } from "@ant-design/icons";
+import React, { useState, useEffect } from "react";
+import { Tree, Input, Button, Modal, message, Upload, Typography } from "antd";
+import { UploadOutlined, CopyOutlined } from "@ant-design/icons";
+
+const { Title } = Typography;
 
 function deepClone(obj) {
   return JSON.parse(JSON.stringify(obj));
@@ -43,15 +45,73 @@ function deleteByPath(obj, pathArr) {
   else delete parent[last];
 }
 
+// 对比两个 JSON，找出所有修改的路径
+function findChangedPaths(original, current, path = []) {
+  const changes = new Set();
+
+  // 如果类型不同，当前路径是修改
+  if (typeof original !== typeof current) {
+    changes.add(path.join('.'));
+    return changes;
+  }
+
+  // 原始值不存在（新增）
+  if (original === undefined || original === null) {
+    changes.add(path.join('.'));
+    return changes;
+  }
+
+  // 当前值不存在（删除）
+  if (current === undefined || current === null) {
+    changes.add(path.join('.'));
+    return changes;
+  }
+
+  // 基本类型对比
+  if (typeof original !== 'object') {
+    if (original !== current) {
+      changes.add(path.join('.'));
+    }
+    return changes;
+  }
+
+  // 数组对比
+  if (Array.isArray(original) && Array.isArray(current)) {
+    const maxLen = Math.max(original.length, current.length);
+    for (let i = 0; i < maxLen; i++) {
+      const subChanges = findChangedPaths(original[i], current[i], [...path, i]);
+      subChanges.forEach(p => changes.add(p));
+    }
+    return changes;
+  }
+
+  // 对象对比
+  if (typeof original === 'object' && typeof current === 'object') {
+    const allKeys = new Set([...Object.keys(original), ...Object.keys(current)]);
+    allKeys.forEach(key => {
+      const subChanges = findChangedPaths(original[key], current[key], [...path, key]);
+      subChanges.forEach(p => changes.add(p));
+    });
+    return changes;
+  }
+
+  return changes;
+}
+
 export default function JsonEditor() {
   const [json, setJson] = useState(null);
+  const [originalJson, setOriginalJson] = useState(null); // 原始 JSON
   const [treeData, setTreeData] = useState([]);
   const [search, setSearch] = useState("");
   const [selected, setSelected] = useState([]);
   const [editModal, setEditModal] = useState({ open: false, path: [], value: "" });
   const [addModal, setAddModal] = useState({ open: false, path: [], key: "", value: "" });
-  const [previewModal, setPreviewModal] = useState(false);
   const [batchModal, setBatchModal] = useState({ open: false, matches: [], value: "" });
+
+  // 预览区搜索
+  const [previewSearch, setPreviewSearch] = useState("");
+  const [previewSearchIndex, setPreviewSearchIndex] = useState(0);
+  const [previewSearchMatches, setPreviewSearchMatches] = useState([]);
 
   const handleFileUpload = (file) => {
     const reader = new FileReader();
@@ -59,6 +119,7 @@ export default function JsonEditor() {
       try {
         const data = JSON.parse(e.target.result);
         setJson(data);
+        setOriginalJson(deepClone(data)); // 保存原始数据
         setTreeData(buildTreeData(data));
         message.success("文件加载成功");
       } catch (error) {
@@ -204,46 +265,345 @@ export default function JsonEditor() {
       .filter(Boolean);
   };
 
+  // 预览搜索：跳转到下一处
+  const handlePreviewSearchNext = () => {
+    if (previewSearchMatches.length === 0) return;
+    const nextIndex = (previewSearchIndex + 1) % previewSearchMatches.length;
+    setPreviewSearchIndex(nextIndex);
+
+    // 滚动到对应位置
+    const previewElement = document.getElementById(`preview-match-${nextIndex}`);
+    if (previewElement) {
+      previewElement.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+  };
+
+  // 预览搜索：跳转到上一处
+  const handlePreviewSearchPrev = () => {
+    if (previewSearchMatches.length === 0) return;
+    const prevIndex = (previewSearchIndex - 1 + previewSearchMatches.length) % previewSearchMatches.length;
+    setPreviewSearchIndex(prevIndex);
+
+    // 滚动到对应位置
+    const previewElement = document.getElementById(`preview-match-${prevIndex}`);
+    if (previewElement) {
+      previewElement.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+  };
+
+  // 只显示修改的内容
+  const [showOnlyChanges, setShowOnlyChanges] = useState(false);
+
+  // 统计预览搜索的匹配数
+  useEffect(() => {
+    if (!previewSearch || !json) {
+      setPreviewSearchMatches([]);
+      return;
+    }
+
+    const jsonStr = JSON.stringify(json, null, 2);
+    const regex = new RegExp(previewSearch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+    const matches = [];
+    let match;
+
+    while ((match = regex.exec(jsonStr)) !== null) {
+      matches.push(match.index);
+    }
+
+    setPreviewSearchMatches(matches);
+    setPreviewSearchIndex(0);
+  }, [previewSearch, json]);
+
+  // 检查路径或其子路径是否有变化
+  const hasChangesInPath = (changedPaths, currentPath) => {
+    const pathStr = currentPath.join('.');
+    // 检查当前路径是否变化
+    if (changedPaths.has(pathStr)) return true;
+    // 检查是否有子路径变化
+    for (const changedPath of changedPaths) {
+      if (changedPath.startsWith(pathStr + '.')) return true;
+    }
+    return false;
+  };
+
+  // 创建搜索计数器的闭包
+  const createRenderJsonWithHighlight = (searchMatchCounterRef) => {
+    return function renderJsonWithHighlight(obj, changedPaths, path = [], indent = 0) {
+      const indentStr = '  '.repeat(indent);
+      const lines = [];
+
+      // 高亮搜索内容的辅助函数
+      const highlightSearchText = (text) => {
+        if (!previewSearch) return text;
+
+        const regex = new RegExp(`(${previewSearch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi');
+        const parts = text.split(regex);
+
+        return parts.map((part, i) => {
+          if (i % 2 === 1) { // 匹配的部分
+            const currentMatchIndex = searchMatchCounterRef.current;
+            searchMatchCounterRef.current++;
+            const isActive = currentMatchIndex === previewSearchIndex;
+            const id = `preview-match-${currentMatchIndex}`;
+            return `<span id="${id}" style="background-color: ${isActive ? '#ffa940' : '#ffe58f'}; padding: 2px 4px; border-radius: 2px; font-weight: 600;">${part}</span>`;
+          }
+          return part;
+        }).join('');
+      };
+
+      if (Array.isArray(obj)) {
+        const filteredItems = [];
+        obj.forEach((item, idx) => {
+          const currentPath = [...path, idx];
+          const pathStr = currentPath.join('.');
+          const isChanged = changedPaths.has(pathStr);
+          const hasChildChanges = hasChangesInPath(changedPaths, currentPath);
+
+          if (showOnlyChanges && !isChanged && !hasChildChanges) return;
+
+          if (typeof item === 'object' && item !== null) {
+            const subLines = renderJsonWithHighlight(item, changedPaths, currentPath, indent + 1);
+            filteredItems.push(subLines);
+          } else {
+            const valueStr = JSON.stringify(item);
+            const line = `${indentStr}  ${valueStr}`;
+            const highlightedLine = highlightSearchText(line);
+
+            filteredItems.push(
+              isChanged
+                ? `<span style="color: #cf1322; font-weight: 600;">${highlightedLine}</span>`
+                : highlightedLine
+            );
+          }
+        });
+
+        if (filteredItems.length === 0 && showOnlyChanges) {
+          return '[]';
+        }
+
+        lines.push('[');
+        filteredItems.forEach((item, idx) => {
+          const comma = idx < filteredItems.length - 1 ? ',' : '';
+          lines.push(item + comma);
+        });
+        lines.push(`${indentStr}]`);
+      } else if (typeof obj === 'object' && obj !== null) {
+        const filteredEntries = [];
+        const entries = Object.entries(obj);
+
+        entries.forEach(([key, value]) => {
+          const currentPath = [...path, key];
+          const pathStr = currentPath.join('.');
+          const isChanged = changedPaths.has(pathStr);
+          const hasChildChanges = hasChangesInPath(changedPaths, currentPath);
+
+          if (showOnlyChanges && !isChanged && !hasChildChanges) return;
+
+          if (typeof value === 'object' && value !== null) {
+            const keyLine = `${indentStr}  "${key}": `;
+            const highlightedKey = highlightSearchText(keyLine);
+            const subLines = renderJsonWithHighlight(value, changedPaths, currentPath, indent + 1);
+
+            const keyPart = isChanged
+              ? `<span style="color: #cf1322; font-weight: 600;">${highlightedKey}</span>`
+              : highlightedKey;
+
+            filteredEntries.push(keyPart + subLines);
+          } else {
+            const valueStr = JSON.stringify(value);
+            const line = `${indentStr}  "${key}": ${valueStr}`;
+            const highlightedLine = highlightSearchText(line);
+
+            filteredEntries.push(
+              isChanged
+                ? `<span style="color: #cf1322; font-weight: 600;">${highlightedLine}</span>`
+                : highlightedLine
+            );
+          }
+        });
+
+        if (filteredEntries.length === 0 && showOnlyChanges) {
+          return '{}';
+        }
+
+        lines.push('{');
+        filteredEntries.forEach((entry, idx) => {
+          const comma = idx < filteredEntries.length - 1 ? ',' : '';
+          lines.push(entry + comma);
+        });
+        lines.push(`${indentStr}}`);
+      }
+
+      return lines.join('\n');
+    };
+  };
+
   return (
-    <div style={{ padding: 24 }}>
-      <div style={{ marginBottom: 16 }}>
-        <Upload beforeUpload={handleFileUpload} accept=".json" showUploadList={false}>
-          <Button icon={<UploadOutlined />}>上传 JSON 文件</Button>
-        </Upload>
+    <div style={{ display: 'flex', height: '100vh', overflow: 'hidden' }}>
+      {/* 左侧编辑器 */}
+      <div style={{
+        flex: 1,
+        padding: 24,
+        overflow: 'auto',
+        borderRight: '1px solid #e8e8e8'
+      }}>
+        <Title level={3} style={{ marginBottom: 16 }}>JSON 编辑器</Title>
+
+        <div style={{ marginBottom: 16 }}>
+          <Upload beforeUpload={handleFileUpload} accept=".json" showUploadList={false}>
+            <Button icon={<UploadOutlined />}>上传 JSON 文件</Button>
+          </Upload>
+        </div>
+
+        {json ? (
+          <>
+            <div style={{ marginBottom: 16, display: 'flex', gap: 8 }}>
+              <Input.Search
+                placeholder="搜索 key 或 value"
+                value={search}
+                onChange={e => setSearch(e.target.value)}
+                style={{ width: 300 }}
+              />
+              <Button onClick={handleBatchEdit} disabled={!search}>
+                批量修改
+              </Button>
+            </div>
+            <Tree
+              treeData={filterTree(treeData)}
+              onSelect={handleSelect}
+              selectedKeys={selected}
+              defaultExpandAll
+              style={{ marginBottom: 16 }}
+            />
+            <Button onClick={handleEdit} disabled={!selected.length} style={{ marginRight: 8 }}>编辑</Button>
+            <Button onClick={handleDelete} disabled={!selected.length} style={{ marginRight: 8 }}>删除</Button>
+            <Button onClick={handleAdd} disabled={!selected.length} style={{ marginRight: 8 }}>新增</Button>
+            <Button onClick={handleExport}>导出 JSON</Button>
+          </>
+        ) : (
+          <div style={{ textAlign: 'center', padding: 48, color: '#999' }}>
+            请上传 JSON 文件以开始编辑
+          </div>
+        )}
       </div>
 
-      {json ? (
-        <>
-          <div style={{ marginBottom: 16, display: 'flex', gap: 8 }}>
-            <Input.Search
-              placeholder="搜索 key 或 value"
-              value={search}
-              onChange={e => setSearch(e.target.value)}
-              style={{ width: 300 }}
-            />
-            <Button onClick={handleBatchEdit} disabled={!search}>
-              批量修改
+      {/* 右侧预览 */}
+      <div style={{
+        width: 600,
+        padding: 24,
+        backgroundColor: '#fafafa',
+        overflow: 'hidden',
+        display: 'flex',
+        flexDirection: 'column'
+      }}>
+        <div style={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          marginBottom: 12
+        }}>
+          <Title level={3} style={{ margin: 0 }}>实时预览</Title>
+          {json && (
+            <Button
+              type="primary"
+              icon={<CopyOutlined />}
+              onClick={handleCopyJson}
+            >
+              复制
             </Button>
-          </div>
-          <Tree
-            treeData={filterTree(treeData)}
-            onSelect={handleSelect}
-            selectedKeys={selected}
-            defaultExpandAll
-            style={{ marginBottom: 16 }}
-          />
-          <Button onClick={handleEdit} disabled={!selected.length} style={{ marginRight: 8 }}>编辑</Button>
-          <Button onClick={handleDelete} disabled={!selected.length} style={{ marginRight: 8 }}>删除</Button>
-          <Button onClick={handleAdd} disabled={!selected.length} style={{ marginRight: 8 }}>新增</Button>
-          <Button onClick={handleExport} style={{ marginRight: 8 }}>导出 JSON</Button>
-          <Button onClick={() => setPreviewModal(true)}>预览 JSON</Button>
-        </>
-      ) : (
-        <div style={{ textAlign: 'center', padding: 48, color: '#999' }}>
-          请上传 JSON 文件以开始编辑
+          )}
         </div>
-      )}
 
+        {json && (
+          <>
+            <div style={{ marginBottom: 12, display: 'flex', gap: 8, alignItems: 'center' }}>
+              <Input
+                placeholder="搜索内容"
+                value={previewSearch}
+                onChange={e => {
+                  setPreviewSearch(e.target.value);
+                  setPreviewSearchIndex(0);
+                }}
+                style={{ flex: 1 }}
+                allowClear
+              />
+              <Button
+                onClick={handlePreviewSearchPrev}
+                disabled={!previewSearch || previewSearchMatches.length === 0}
+              >
+                上一处
+              </Button>
+              <Button
+                onClick={handlePreviewSearchNext}
+                disabled={!previewSearch || previewSearchMatches.length === 0}
+              >
+                下一处
+              </Button>
+            </div>
+
+            <div style={{ marginBottom: 12, display: 'flex', gap: 12, alignItems: 'center' }}>
+              <label style={{ display: 'flex', alignItems: 'center', cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={showOnlyChanges}
+                  onChange={e => setShowOnlyChanges(e.target.checked)}
+                  style={{ marginRight: 6 }}
+                />
+                <span style={{ fontSize: 14 }}>只显示修改</span>
+              </label>
+              {originalJson && (
+                <span style={{ fontSize: 12, color: '#666' }}>
+                  已修改 {findChangedPaths(originalJson, json).size} 处
+                </span>
+              )}
+              {previewSearch && (
+                <span style={{ fontSize: 12, color: '#666' }}>
+                  找到 {previewSearchMatches.length} 处
+                </span>
+              )}
+            </div>
+          </>
+        )}
+
+        {json ? (
+          <pre
+            style={{
+              flex: 1,
+              overflow: 'auto',
+              padding: 16,
+              backgroundColor: '#fff',
+              borderRadius: 4,
+              fontSize: 13,
+              lineHeight: 1.5,
+              border: '1px solid #e8e8e8',
+              margin: 0,
+              whiteSpace: 'pre-wrap',
+              wordBreak: 'break-word'
+            }}
+            dangerouslySetInnerHTML={{
+              __html: originalJson
+                ? (() => {
+                    const counterRef = { current: 0 };
+                    const renderFn = createRenderJsonWithHighlight(counterRef);
+                    return renderFn(json, findChangedPaths(originalJson, json));
+                  })()
+                : JSON.stringify(json, null, 2)
+            }}
+          />
+        ) : (
+          <div style={{
+            flex: 1,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            color: '#999'
+          }}>
+            暂无内容
+          </div>
+        )}
+      </div>
+
+      {/* 编辑弹窗 */}
       <Modal
         open={editModal.open}
         title="编辑字段"
@@ -256,6 +616,8 @@ export default function JsonEditor() {
           rows={4}
         />
       </Modal>
+
+      {/* 新增弹窗 */}
       <Modal
         open={addModal.open}
         title="新增字段"
@@ -275,32 +637,8 @@ export default function JsonEditor() {
           rows={4}
         />
       </Modal>
-      <Modal
-        open={previewModal}
-        title="预览 JSON"
-        onCancel={() => setPreviewModal(false)}
-        footer={[
-          <Button key="copy" type="primary" onClick={handleCopyJson}>
-            一键复制
-          </Button>,
-          <Button key="close" onClick={() => setPreviewModal(false)}>
-            关闭
-          </Button>
-        ]}
-        width={800}
-      >
-        <pre style={{
-          maxHeight: 600,
-          overflow: 'auto',
-          padding: 16,
-          backgroundColor: '#f5f5f5',
-          borderRadius: 4,
-          fontSize: 13,
-          lineHeight: 1.5
-        }}>
-          {JSON.stringify(json, null, 2)}
-        </pre>
-      </Modal>
+
+      {/* 批量修改弹窗 */}
       <Modal
         open={batchModal.open}
         title={`批量修改 (共 ${batchModal.matches.length} 个字段)`}
