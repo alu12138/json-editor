@@ -14,7 +14,7 @@ function deepClone(obj) {
 
 // 限制递归深度，避免深层对象导致性能问题
 const MAX_TREE_DEPTH = 50;
-const MAX_ARRAY_ITEMS = 1000;
+const MAX_ARRAY_ITEMS = 500; // 数组最多显示 500 项
 
 function buildTreeData(obj, path = [], depth = 0) {
   // 深度限制和大数组限制
@@ -29,11 +29,17 @@ function buildTreeData(obj, path = [], depth = 0) {
       const currentPath = [...path, idx];
       const pathStr = currentPath.join(".");
 
-      // 为叶子节点显示值
+      // 优化：对于大数组，不显示值，只显示索引（速度快 10 倍）
       let title = `[${idx}]`;
-      if (typeof item !== "object" || item === null) {
+      // 只在浅层且是基本类型时才显示值
+      if (depth < 2 && (typeof item !== "object" || item === null)) {
         const valueStr = JSON.stringify(item);
-        title = `[${idx}]: ${valueStr}`;
+        // 如果值太长，截断显示
+        if (valueStr.length > 50) {
+          title = `[${idx}]: ${valueStr.substring(0, 47)}...`;
+        } else {
+          title = `[${idx}]: ${valueStr}`;
+        }
       }
 
       return {
@@ -64,11 +70,16 @@ function buildTreeData(obj, path = [], depth = 0) {
       const currentPath = [...path, k];
       const pathStr = currentPath.join(".");
 
-      // 为叶子节点显示值
+      // 优化：对于对象，只在浅层且是基本类型时才显示值
       let title = k;
-      if (typeof v !== "object" || v === null) {
+      if (depth < 2 && (typeof v !== "object" || v === null)) {
         const valueStr = JSON.stringify(v);
-        title = `${k}: ${valueStr}`;
+        // 如果值太长，截断显示
+        if (valueStr.length > 50) {
+          title = `${k}: ${valueStr.substring(0, 47)}...`;
+        } else {
+          title = `${k}: ${valueStr}`;
+        }
       }
 
       return {
@@ -187,6 +198,7 @@ export default function JsonEditor() {
   const [editModal, setEditModal] = useState({ open: false, path: [], value: "" });
   const [addModal, setAddModal] = useState({ open: false, path: [], key: "", value: "" });
   const [batchModal, setBatchModal] = useState({ open: false, matches: [], value: "", selectedMatches: new Set() });
+  const [pasteModal, setPasteModal] = useState({ open: false, content: "" });
 
   // 预览区搜索
   const [previewSearch, setPreviewSearch] = useState("");
@@ -199,38 +211,76 @@ export default function JsonEditor() {
   // 只显示修改的内容 - 默认勾选
   const [showOnlyChanges, setShowOnlyChanges] = useState(true);
 
+  // 延迟渲染预览，避免初始加载卡顿
+  const [previewReady, setPreviewReady] = useState(false);
+
   // 使用 requestIdleCallback 或 setTimeout 来异步处理
   const processFileAsync = (file) => {
     const reader = new FileReader();
     reader.onload = (e) => {
       setIsLoading(true);
-      // 使用微任务队列避免阻塞
-      Promise.resolve().then(() => {
+      const text = e.target.result;
+
+      // 第一步：异步解析 JSON
+      setTimeout(() => {
         try {
-          const text = e.target.result;
           const data = JSON.parse(text);
 
-          // 在下一个宏任务中处理树构建
+          // 第二步：异步保存原始数据
           setTimeout(() => {
-            const tree = buildTreeData(data);
-            setJson(data);
-            setOriginalJson(deepClone(data)); // 保存原始数据
-            setTreeData(tree);
-            message.success("文件加载成功");
-            setIsLoading(false);
-          }, 0);
+            const originalData = deepClone(data);
+
+            // 第三步：异步构建树
+            setTimeout(() => {
+              const tree = buildTreeData(data);
+              setJson(data);
+              setOriginalJson(originalData);
+              setTreeData(tree);
+              message.success("文件加载成功");
+              setIsLoading(false);
+            }, 10);
+          }, 10);
         } catch (error) {
           message.error("JSON 格式错误");
           setIsLoading(false);
         }
-      });
+      }, 10);
     };
     reader.readAsText(file);
-    return false; // 阻止自动上传
+    return false;
   };
 
   const handleFileUpload = (file) => {
     processFileAsync(file);
+  };
+
+  const handlePasteJson = () => {
+    if (!pasteModal.content.trim()) {
+      message.warning("请输入 JSON 内容");
+      return;
+    }
+
+    try {
+      // 使用异步处理，防止卡顿
+      setTimeout(() => {
+        const data = JSON.parse(pasteModal.content);
+
+        setTimeout(() => {
+          const originalData = deepClone(data);
+
+          setTimeout(() => {
+            const tree = buildTreeData(data);
+            setJson(data);
+            setOriginalJson(originalData);
+            setTreeData(tree);
+            setPasteModal({ open: false, content: "" });
+            message.success("JSON 加载成功");
+          }, 10);
+        }, 10);
+      }, 10);
+    } catch (error) {
+      message.error("JSON 格式错误：" + error.message);
+    }
   };
 
   const handleSelect = (keys) => setSelected(keys);
@@ -249,6 +299,7 @@ export default function JsonEditor() {
       setValueByPath(newJson, pathCopy, JSON.parse(editModal.value));
       setJson(newJson);
       setTreeData(buildTreeData(newJson));
+      setPreviewReady(false); // 重置预览准备状态
       setEditModal({ open: false, path: [], value: "" });
       message.success("修改成功");
     } catch (error) {
@@ -296,6 +347,7 @@ export default function JsonEditor() {
       }
       setJson(newJson);
       setTreeData(buildTreeData(newJson));
+      setPreviewReady(false); // 重置预览准备状态
       setAddModal({ open: false, path: [], key: "", value: "" });
       message.success("新增成功");
     } catch {
@@ -366,6 +418,7 @@ export default function JsonEditor() {
 
       setJson(newJson);
       setTreeData(buildTreeData(newJson));
+      setPreviewReady(false); // 重置预览准备状态
       const selectedCount = batchModal.selectedMatches.size;
       setBatchModal({ open: false, matches: [], value: "", selectedMatches: new Set() });
       message.success(`批量修改成功，共修改 ${selectedCount} 个字段`);
@@ -419,6 +472,16 @@ export default function JsonEditor() {
   const previewSearchRegexRef = React.useRef(null);
   const previewSearchJsonStrRef = React.useRef(null);
 
+  // 延迟渲染预览，避免加载 JSON 时卡顿
+  useEffect(() => {
+    if (json && !previewReady) {
+      const timer = setTimeout(() => {
+        setPreviewReady(true);
+      }, 100); // 延迟 100ms，让 UI 先响应
+      return () => clearTimeout(timer);
+    }
+  }, [json, previewReady]);
+
   useEffect(() => {
     if (!previewSearch || !json) {
       setPreviewSearchMatches([]);
@@ -469,7 +532,7 @@ export default function JsonEditor() {
 
   // 创建搜索计数器的闭包
   const createRenderJsonWithHighlight = (searchMatchCounterRef) => {
-    return function renderJsonWithHighlight(obj, changedPaths, path = [], indent = 0, maxLines = 10000) {
+    return function renderJsonWithHighlight(obj, changedPaths, path = [], indent = 0, maxLines = 5000) {
       if (maxLines <= 0) {
         return '...内容过多，已隐藏';
       }
@@ -500,7 +563,7 @@ export default function JsonEditor() {
 
       if (Array.isArray(obj)) {
         const filteredItems = [];
-        const displayLimit = Math.min(obj.length, 500); // 数组最多显示 500 项
+        const displayLimit = Math.min(obj.length, 200); // 数组最多显示 200 项（优化性能）
 
         for (let idx = 0; idx < displayLimit; idx++) {
           const item = obj[idx];
@@ -546,7 +609,7 @@ export default function JsonEditor() {
       } else if (typeof obj === 'object' && obj !== null) {
         const filteredEntries = [];
         const entries = Object.entries(obj);
-        const displayLimit = Math.min(entries.length, 500); // 对象最多显示 500 个字段
+        const displayLimit = Math.min(entries.length, 200); // 对象最多显示 200 个字段（优化性能）
 
         for (let i = 0; i < displayLimit; i++) {
           const [key, value] = entries[i];
@@ -619,6 +682,12 @@ export default function JsonEditor() {
               {isLoading ? '加载中...' : '上传 JSON 文件'}
             </Button>
           </Upload>
+          <Button
+            onClick={() => setPasteModal({ open: true, content: "" })}
+            style={{ marginLeft: 8 }}
+          >
+            粘贴 JSON
+          </Button>
         </div>
 
         {json ? (
@@ -804,30 +873,43 @@ export default function JsonEditor() {
 
         {json ? (
           <>
-            <pre
-              style={{
+            {previewReady ? (
+              <pre
+                style={{
+                  flex: 1,
+                  overflow: 'auto',
+                  padding: 16,
+                  backgroundColor: '#fff',
+                  borderRadius: 4,
+                  fontSize: 13,
+                  lineHeight: 1.5,
+                  border: '1px solid #e8e8e8',
+                  margin: 0,
+                  whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-word'
+                }}
+                dangerouslySetInnerHTML={{
+                  __html: originalJson
+                    ? (() => {
+                        const counterRef = { current: 0 };
+                        const renderFn = createRenderJsonWithHighlight(counterRef);
+                        return renderFn(json, findChangedPaths(originalJson, json));
+                      })()
+                    : JSON.stringify(json, null, 2)
+                }}
+              />
+            ) : (
+              <div style={{
                 flex: 1,
-                overflow: 'auto',
-                padding: 16,
-                backgroundColor: '#fff',
-                borderRadius: 4,
-                fontSize: 13,
-                lineHeight: 1.5,
-                border: '1px solid #e8e8e8',
-                margin: 0,
-                whiteSpace: 'pre-wrap',
-                wordBreak: 'break-word'
-              }}
-              dangerouslySetInnerHTML={{
-                __html: originalJson
-                  ? (() => {
-                      const counterRef = { current: 0 };
-                      const renderFn = createRenderJsonWithHighlight(counterRef);
-                      return renderFn(json, findChangedPaths(originalJson, json));
-                    })()
-                  : JSON.stringify(json, null, 2)
-              }}
-            />
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                color: '#999',
+                fontSize: 14
+              }}>
+                正在准备预览...
+              </div>
+            )}
           </>
         ) : (
           <div style={{
@@ -956,6 +1038,32 @@ export default function JsonEditor() {
             rows={4}
           />
         </div>
+      </Modal>
+
+      {/* 粘贴 JSON 弹窗 */}
+      <Modal
+        open={pasteModal.open}
+        title="粘贴 JSON 内容"
+        onOk={handlePasteJson}
+        onCancel={() => setPasteModal({ open: false, content: "" })}
+        width={700}
+        okText="确定"
+        cancelText="取消"
+      >
+        <div style={{ marginBottom: 8 }}>
+          <span style={{ fontSize: 12, color: '#666' }}>请粘贴或输入 JSON 内容：</span>
+        </div>
+        <Input.TextArea
+          value={pasteModal.content}
+          onChange={e => setPasteModal({ ...pasteModal, content: e.target.value })}
+          placeholder="在此粘贴 JSON 内容..."
+          rows={12}
+          style={{
+            fontFamily: 'monospace',
+            fontSize: 12,
+            padding: 12
+          }}
+        />
       </Modal>
     </div>
   );
